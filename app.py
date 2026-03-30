@@ -113,7 +113,46 @@ def normalize_date_string(value) -> str:
     except Exception:
         raise ValueError("日付の形式が不正です。YYYY-MM-DD 形式推奨です。")
 
+def read_flexible_csv(uploaded_file) -> pd.DataFrame:
+    """
+    区切り文字を自動判定しながらCSVを読む
+    , / ， / ; / タブ に対応
+    """
+    raw = uploaded_file.getvalue()
 
+    encodings = ["utf-8-sig", "utf-8", "cp932", "shift_jis"]
+    text = None
+
+    for enc in encodings:
+        try:
+            text = raw.decode(enc)
+            break
+        except Exception:
+            continue
+
+    if text is None:
+        raise ValueError("CSVの文字コードを読み取れませんでした。utf-8 または cp932 で保存してください。")
+
+    # よくある区切り文字候補を試す
+    candidates = [",", "，", ";", "\t"]
+
+    best_df = None
+    best_cols = 0
+
+    for sep in candidates:
+        try:
+            from io import StringIO
+            df = pd.read_csv(StringIO(text), sep=sep)
+            if df.shape[1] > best_cols:
+                best_df = df
+                best_cols = df.shape[1]
+        except Exception:
+            pass
+
+    if best_df is None or best_cols <= 1:
+        raise ValueError("CSVの列区切りを判定できませんでした。半角カンマ区切りで保存してください。")
+
+    return best_df
 # =========================================================
 # テンプレートCSV
 # =========================================================
