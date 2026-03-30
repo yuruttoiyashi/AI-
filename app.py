@@ -27,7 +27,6 @@ DB_PATH = DB_DIR / "inventory.db"
 # APIキー取得
 # =========================================================
 def get_api_key() -> str:
-    """Streamlit secrets → 環境変数 の順で取得"""
     try:
         api_key = st.secrets.get("GEMINI_API_KEY", "")
     except Exception:
@@ -108,8 +107,15 @@ def format_number(value) -> str:
         return str(value)
 
 
+def normalize_date_string(value) -> str:
+    try:
+        return pd.to_datetime(value).strftime("%Y-%m-%d")
+    except Exception:
+        raise ValueError("日付の形式が不正です。YYYY-MM-DD 形式推奨です。")
+
+
 # =========================================================
-# 商品マスタCSVテンプレート
+# テンプレートCSV
 # =========================================================
 def get_product_template_df() -> pd.DataFrame:
     return pd.DataFrame([
@@ -134,6 +140,48 @@ def get_product_template_df() -> pd.DataFrame:
             "適正在庫数": 40,
             "仕入先": "東日本包装",
             "備考": "壊れ物梱包用"
+        }
+    ])
+
+
+def get_inbound_template_df() -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "取引日": "2026-03-30",
+            "商品コード": "P001",
+            "数量": 100,
+            "取引先": "山田梱包資材",
+            "担当者": "佐藤",
+            "備考": "初回入庫"
+        },
+        {
+            "取引日": "2026-03-30",
+            "商品コード": "P002",
+            "数量": 20,
+            "取引先": "東日本包装",
+            "担当者": "佐藤",
+            "備考": "追加補充"
+        }
+    ])
+
+
+def get_outbound_template_df() -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "取引日": "2026-03-30",
+            "商品コード": "P001",
+            "数量": 15,
+            "取引先": "ABC商事",
+            "担当者": "田中",
+            "備考": "出荷分"
+        },
+        {
+            "取引日": "2026-03-30",
+            "商品コード": "P002",
+            "数量": 5,
+            "取引先": "XYZ物流",
+            "担当者": "田中",
+            "備考": "緊急出庫"
         }
     ])
 
@@ -284,6 +332,13 @@ def get_product_options() -> pd.DataFrame:
     return df
 
 
+def get_product_code_set() -> set:
+    products = get_product_options()
+    if products.empty:
+        return set()
+    return set(products["product_code"].astype(str).tolist())
+
+
 # =========================================================
 # 入出庫関連
 # =========================================================
@@ -320,6 +375,169 @@ def add_transaction(
         return True, "登録しました。"
     except Exception as e:
         return False, f"登録中にエラーが発生しました: {e}"
+    finally:
+        conn.close()
+
+
+def import_inbound_from_csv(df_csv: pd.DataFrame):
+    required_cols = ["取引日", "商品コード", "数量", "取引先", "担当者", "備考"]
+    missing_cols = [col for col in required_cols if col not in df_csv.columns]
+    if missing_cols:
+        return False, f"CSVに必要な列がありません: {', '.join(missing_cols)}", []
+
+    valid_codes = get_product_code_set()
+    if not valid_codes:
+        return False, "先に商品マスタを登録してください。", []
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    inserted = 0
+    errors = []
+
+    try:
+        for idx, row in df_csv.iterrows():
+            try:
+                transaction_date = normalize_date_string(row["取引日"])
+                product_code = str(row["商品コード"]).strip()
+                quantity = float(row["数量"]) if pd.notna(row["数量"]) else 0
+                partner = str(row["取引先"]).strip() if pd.notna(row["取引先"]) else ""
+                staff = str(row["担当者"]).strip() if pd.notna(row["担当者"]) else ""
+                remarks = str(row["備考"]).strip() if pd.notna(row["備考"]) else ""
+
+                if not product_code or product_code.lower() == "nan":
+                    errors.append(f"{idx + 2}行目: 商品コードが空です")
+                    continue
+
+                if product_code not in valid_codes:
+                    errors.append(f"{idx + 2}行目: 商品コード {product_code} は商品マスタに存在しません")
+                    continue
+
+                if quantity <= 0:
+                    errors.append(f"{idx + 2}行目: 数量は0より大きくしてください")
+                    continue
+
+                cur.execute("""
+                    INSERT INTO stock_transactions (
+                        transaction_date, product_code, transaction_type,
+                        quantity, partner, staff, remarks, created_at
+                    )
+                    VALUES (?, ?, 'IN', ?, ?, ?, ?, ?)
+                """, (
+                    transaction_date,
+                    product_code,
+                    quantity,
+                    partner,
+                    staff,
+                    remarks,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                ))
+                inserted += 1
+
+            except Exception as e:
+                errors.append(f"{idx + 2}行目: {e}")
+
+        conn.commit()
+        message = f"入庫CSV取込完了: {inserted}件登録"
+        if errors:
+            message += f" / エラー {len(errors)}件"
+        return True, message, errors
+
+    except Exception as e:
+        conn.rollback()
+        return False, f"入庫CSV取込中にエラーが発生しました: {e}", []
+    finally:
+        conn.close()
+
+
+def get_current_stock_map() -> dict:
+    df_inventory = get_inventory_data()
+    if df_inventory.empty:
+        return {}
+    return {
+        str(row["product_code"]): float(row["current_stock"])
+        for _, row in df_inventory.iterrows()
+    }
+
+
+def import_outbound_from_csv(df_csv: pd.DataFrame):
+    required_cols = ["取引日", "商品コード", "数量", "取引先", "担当者", "備考"]
+    missing_cols = [col for col in required_cols if col not in df_csv.columns]
+    if missing_cols:
+        return False, f"CSVに必要な列がありません: {', '.join(missing_cols)}", []
+
+    valid_codes = get_product_code_set()
+    if not valid_codes:
+        return False, "先に商品マスタを登録してください。", []
+
+    stock_map = get_current_stock_map()
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    inserted = 0
+    errors = []
+
+    try:
+        for idx, row in df_csv.iterrows():
+            try:
+                transaction_date = normalize_date_string(row["取引日"])
+                product_code = str(row["商品コード"]).strip()
+                quantity = float(row["数量"]) if pd.notna(row["数量"]) else 0
+                partner = str(row["取引先"]).strip() if pd.notna(row["取引先"]) else ""
+                staff = str(row["担当者"]).strip() if pd.notna(row["担当者"]) else ""
+                remarks = str(row["備考"]).strip() if pd.notna(row["備考"]) else ""
+
+                if not product_code or product_code.lower() == "nan":
+                    errors.append(f"{idx + 2}行目: 商品コードが空です")
+                    continue
+
+                if product_code not in valid_codes:
+                    errors.append(f"{idx + 2}行目: 商品コード {product_code} は商品マスタに存在しません")
+                    continue
+
+                if quantity <= 0:
+                    errors.append(f"{idx + 2}行目: 数量は0より大きくしてください")
+                    continue
+
+                current_stock = float(stock_map.get(product_code, 0))
+                if quantity > current_stock:
+                    errors.append(
+                        f"{idx + 2}行目: 商品コード {product_code} の在庫不足です（現在庫 {format_number(current_stock)} / 出庫数 {format_number(quantity)}）"
+                    )
+                    continue
+
+                cur.execute("""
+                    INSERT INTO stock_transactions (
+                        transaction_date, product_code, transaction_type,
+                        quantity, partner, staff, remarks, created_at
+                    )
+                    VALUES (?, ?, 'OUT', ?, ?, ?, ?, ?)
+                """, (
+                    transaction_date,
+                    product_code,
+                    quantity,
+                    partner,
+                    staff,
+                    remarks,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                ))
+                inserted += 1
+
+                stock_map[product_code] = current_stock - quantity
+
+            except Exception as e:
+                errors.append(f"{idx + 2}行目: {e}")
+
+        conn.commit()
+        message = f"出庫CSV取込完了: {inserted}件登録"
+        if errors:
+            message += f" / エラー {len(errors)}件"
+        return True, message, errors
+
+    except Exception as e:
+        conn.rollback()
+        return False, f"出庫CSV取込中にエラーが発生しました: {e}", []
     finally:
         conn.close()
 
@@ -628,7 +846,8 @@ def show_product_csv_import():
     st.markdown("### ② CSVをアップロード")
     uploaded_file = st.file_uploader(
         "商品マスタCSVを選択してください",
-        type=["csv"]
+        type=["csv"],
+        key="product_csv"
     )
 
     if uploaded_file is not None:
@@ -641,7 +860,7 @@ def show_product_csv_import():
         st.markdown("### ③ 読み込み内容プレビュー")
         st.dataframe(df_csv, use_container_width=True)
 
-        if st.button("このCSVを取り込む"):
+        if st.button("この商品マスタCSVを取り込む"):
             success, message, errors = import_products_from_csv(df_csv)
 
             if success:
@@ -725,6 +944,48 @@ def show_inbound_form():
             st.error(message)
 
 
+def show_inbound_csv_import():
+    st.subheader("📥 入庫CSV一括取込")
+
+    st.markdown("### ① テンプレートをダウンロード")
+    template_df = get_inbound_template_df()
+    st.download_button(
+        "入庫CSVテンプレートをダウンロード",
+        data=to_csv_bytes(template_df),
+        file_name="inbound_template.csv",
+        mime="text/csv"
+    )
+
+    st.markdown("### ② CSVをアップロード")
+    uploaded_file = st.file_uploader(
+        "入庫CSVを選択してください",
+        type=["csv"],
+        key="inbound_csv"
+    )
+
+    if uploaded_file is not None:
+        try:
+            df_csv = pd.read_csv(uploaded_file, encoding="utf-8-sig")
+        except Exception:
+            uploaded_file.seek(0)
+            df_csv = pd.read_csv(uploaded_file, encoding="utf-8")
+
+        st.markdown("### ③ 読み込み内容プレビュー")
+        st.dataframe(df_csv, use_container_width=True)
+
+        if st.button("この入庫CSVを取り込む"):
+            success, message, errors = import_inbound_from_csv(df_csv)
+
+            if success:
+                st.success(message)
+                if errors:
+                    st.warning("一部エラーがあります。詳細を確認してください。")
+                    for err in errors:
+                        st.write(f"- {err}")
+            else:
+                st.error(message)
+
+
 def show_outbound_form():
     st.subheader("📤 出庫登録")
 
@@ -774,6 +1035,48 @@ def show_outbound_form():
             st.success(f"出庫を登録しました。 商品コード: {product_code} / 数量: {format_number(quantity)}")
         else:
             st.error(message)
+
+
+def show_outbound_csv_import():
+    st.subheader("📤 出庫CSV一括取込")
+
+    st.markdown("### ① テンプレートをダウンロード")
+    template_df = get_outbound_template_df()
+    st.download_button(
+        "出庫CSVテンプレートをダウンロード",
+        data=to_csv_bytes(template_df),
+        file_name="outbound_template.csv",
+        mime="text/csv"
+    )
+
+    st.markdown("### ② CSVをアップロード")
+    uploaded_file = st.file_uploader(
+        "出庫CSVを選択してください",
+        type=["csv"],
+        key="outbound_csv"
+    )
+
+    if uploaded_file is not None:
+        try:
+            df_csv = pd.read_csv(uploaded_file, encoding="utf-8-sig")
+        except Exception:
+            uploaded_file.seek(0)
+            df_csv = pd.read_csv(uploaded_file, encoding="utf-8")
+
+        st.markdown("### ③ 読み込み内容プレビュー")
+        st.dataframe(df_csv, use_container_width=True)
+
+        if st.button("この出庫CSVを取り込む"):
+            success, message, errors = import_outbound_from_csv(df_csv)
+
+            if success:
+                st.success(message)
+                if errors:
+                    st.warning("一部エラーがあります。詳細を確認してください。")
+                    for err in errors:
+                        st.write(f"- {err}")
+            else:
+                st.error(message)
 
 
 def show_inventory_list():
@@ -870,7 +1173,9 @@ def main():
         "商品マスタCSV取込",
         "商品一覧",
         "入庫登録",
+        "入庫CSV取込",
         "出庫登録",
+        "出庫CSV取込",
         "在庫一覧",
         "AI分析"
     ]
@@ -886,8 +1191,12 @@ def main():
         show_product_list()
     elif choice == "入庫登録":
         show_inbound_form()
+    elif choice == "入庫CSV取込":
+        show_inbound_csv_import()
     elif choice == "出庫登録":
         show_outbound_form()
+    elif choice == "出庫CSV取込":
+        show_outbound_csv_import()
     elif choice == "在庫一覧":
         show_inventory_list()
     elif choice == "AI分析":
