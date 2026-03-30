@@ -1039,15 +1039,11 @@ def show_inbound_csv_import():
     )
 
     if uploaded_file is not None:
-        try:
-            df_csv = pd.read_csv(uploaded_file, encoding="utf-8-sig")
-        except Exception:
-            uploaded_file.seek(0)
-            df_csv = pd.read_csv(uploaded_file, encoding="utf-8")
-
-        st.markdown("### ③ 読み込み内容プレビュー")
-        st.dataframe(df_csv, use_container_width=True)
-
+    try:
+        df_csv = read_flexible_csv(uploaded_file)
+    except Exception as e:
+        st.error(f"CSV読み込みエラー: {e}")
+        return
         if st.button("この入庫CSVを取り込む"):
             success, message, errors = import_inbound_from_csv(df_csv)
 
@@ -1132,14 +1128,11 @@ def show_outbound_csv_import():
     )
 
     if uploaded_file is not None:
-        try:
-            df_csv = pd.read_csv(uploaded_file, encoding="utf-8-sig")
-        except Exception:
-            uploaded_file.seek(0)
-            df_csv = pd.read_csv(uploaded_file, encoding="utf-8")
-
-        st.markdown("### ③ 読み込み内容プレビュー")
-        st.dataframe(df_csv, use_container_width=True)
+    try:
+        df_csv = read_flexible_csv(uploaded_file)
+    except Exception as e:
+        st.error(f"CSV読み込みエラー: {e}")
+        return
 
         if st.button("この出庫CSVを取り込む"):
             success, message, errors = import_outbound_from_csv(df_csv)
