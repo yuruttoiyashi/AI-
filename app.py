@@ -1,21 +1,58 @@
-import streamlit as st
-import pandas as pd
-import sqlite3
-from datetime import datetime
 import os
-import io
+import sqlite3
+from datetime import datetime, date
+from pathlib import Path
 
-# ==========================================
-# 1. データベース初期化
-# ==========================================
-DB_NAME = "inventory.db"
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+
+# =========================================================
+# 基本設定
+# =========================================================
+st.set_page_config(
+    page_title="物流向けAI在庫管理アプリ",
+    page_icon="📦",
+    layout="wide"
+)
+
+APP_TITLE = "物流向けAI在庫管理アプリ"
+DB_DIR = Path("data")
+DB_DIR.mkdir(exist_ok=True)
+DB_PATH = DB_DIR / "inventory.db"
+
+
+# =========================================================
+# APIキー取得
+# =========================================================
+def get_api_key() -> str:
+    """Streamlit secrets → 環境変数 の順で取得"""
+    try:
+        api_key = st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        api_key = ""
+
+    if not api_key:
+        api_key = os.getenv("GEMINI_API_KEY", "")
+
+    return api_key
+
+
+# =========================================================
+# DB関連
+# =========================================================
+def get_connection():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    
-    # 商品マスタテーブル
-    c.execute('''
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             product_code TEXT UNIQUE NOT NULL,
@@ -27,332 +64,681 @@ def init_db():
             optimal_stock REAL DEFAULT 0,
             supplier TEXT,
             remarks TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
-    ''')
-    
-    # 入出庫履歴テーブル
-    c.execute('''
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS stock_transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            transaction_date DATE NOT NULL,
+            transaction_date TEXT NOT NULL,
             product_code TEXT NOT NULL,
-            transaction_type TEXT NOT NULL, -- IN or OUT
+            transaction_type TEXT NOT NULL,
             quantity REAL NOT NULL,
             partner TEXT,
             staff TEXT,
             remarks TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (product_code) REFERENCES products(product_code)
         )
-    ''')
+    """)
+
     conn.commit()
     conn.close()
 
-# データベース接続用関数
-def get_connection():
-    return sqlite3.connect(DB_NAME)
 
-# ==========================================
-# 2. AI分析ロジック (Gemini API 拡張用)
-# ==========================================
-def generate_ai_advice(inventory_df, low_stock_df):
-    """
-    在庫データに基づいたAIアドバイスを生成する関数。
-    現在はルールベースだが、将来的にGoogle Gemini API等に置き換え可能。
-    """
-    # APIキーが設定されているか確認 (将来用)
-    api_key = os.getenv("GEMINI_API_KEY")
-    
-    if not api_key or api_key == "MY_GEMINI_API_KEY":
-        # --- ルールベースの簡易コメント (API未設定時) ---
-        advice = "### 🤖 AI在庫分析レポート (簡易版)\n\n"
-        
-        if len(low_stock_df) > 0:
-            advice += f"⚠️ **警告:** 現在、{len(low_stock_df)}件の商品が最低在庫を下回っています。早急な発注を検討してください。\n\n"
-            for _, row in low_stock_df.iterrows():
-                advice += f"- **{row['product_name']}**: 現在庫 {row['current_stock']} (最低在庫: {row['min_stock']})\n"
-        else:
-            advice += "✅ **良好:** 現在、最低在庫を下回っている商品はありません。\n\n"
-            
-        # 在庫バランスのチェック
-        over_stock = inventory_df[inventory_df['current_stock'] > inventory_df['optimal_stock'] * 1.5]
-        if len(over_stock) > 0:
-            advice += "\n📦 **過剰在庫の懸念:**\n"
-            for _, row in over_stock.iterrows():
-                advice += f"- **{row['product_name']}**: 適正在庫の1.5倍を超えています。入庫調整を検討してください。\n"
-        
-        advice += "\n---\n*※Google Gemini APIを設定すると、より高度な需要予測や最適化アドバイスが受けられます。*"
-        return advice
-    else:
-        # --- ここに Gemini API を使用した高度な分析を実装可能 ---
-        # 例: 過去のトレンド分析、季節性の考慮など
-        return "🤖 (Gemini API連携モード) 高度な分析結果をここに表示します。"
+# =========================================================
+# 共通ユーティリティ
+# =========================================================
+def to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8-sig")
 
-# ==========================================
-# 3. ユーティリティ関数
-# ==========================================
-def get_inventory_data():
+
+def safe_contains(series: pd.Series, keyword: str) -> pd.Series:
+    return series.astype(str).str.contains(keyword, case=False, na=False)
+
+
+def format_number(value) -> str:
+    try:
+        if float(value).is_integer():
+            return str(int(float(value)))
+        return f"{float(value):,.2f}"
+    except Exception:
+        return str(value)
+
+
+# =========================================================
+# 商品マスタ関連
+# =========================================================
+def add_product(
+    product_code: str,
+    product_name: str,
+    category: str,
+    unit: str,
+    location: str,
+    min_stock: float,
+    optimal_stock: float,
+    supplier: str,
+    remarks: str
+):
     conn = get_connection()
-    # 入庫合計
-    in_query = "SELECT product_code, SUM(quantity) as total_in FROM stock_transactions WHERE transaction_type = 'IN' GROUP BY product_code"
-    # 出庫合計
-    out_query = "SELECT product_code, SUM(quantity) as total_out FROM stock_transactions WHERE transaction_type = 'OUT' GROUP BY product_code"
-    
-    df_products = pd.read_sql("SELECT * FROM products", conn)
-    df_in = pd.read_sql(in_query, conn)
-    df_out = pd.read_sql(out_query, conn)
-    
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            INSERT INTO products (
+                product_code, product_name, category, unit, location,
+                min_stock, optimal_stock, supplier, remarks, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            product_code.strip(),
+            product_name.strip(),
+            category.strip(),
+            unit.strip(),
+            location.strip(),
+            float(min_stock),
+            float(optimal_stock),
+            supplier.strip(),
+            remarks.strip(),
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ))
+        conn.commit()
+        return True, "商品を登録しました。"
+    except sqlite3.IntegrityError:
+        return False, "この商品コードは既に登録されています。"
+    except Exception as e:
+        return False, f"登録中にエラーが発生しました: {e}"
+    finally:
+        conn.close()
+
+
+def get_products() -> pd.DataFrame:
+    conn = get_connection()
+    df = pd.read_sql("SELECT * FROM products ORDER BY product_code", conn)
     conn.close()
-    
-    # マージして在庫計算
-    df = pd.merge(df_products, df_in, on='product_code', how='left').fillna(0)
-    df = pd.merge(df, df_out, on='product_code', how='left').fillna(0)
-    df['current_stock'] = df['total_in'] - df['total_out']
-    
-    # ステータス判定
-    def get_status(row):
-        if row['current_stock'] <= row['min_stock']:
-            return "要発注"
-        elif row['current_stock'] <= row['min_stock'] + 5:
-            return "注意"
-        else:
-            return "正常"
-            
-    df['status'] = df.apply(get_status, axis=1)
     return df
 
-# ==========================================
-# 4. メインアプリケーション (Streamlit UI)
-# ==========================================
-def main():
-    st.set_page_config(page_title="AI在庫管理システム", layout="wide")
-    init_db()
-    
-    st.sidebar.title("📦 在庫管理メニュー")
-    menu = ["ダッシュボード", "商品マスタ登録", "商品一覧", "入庫登録", "出庫登録", "在庫一覧", "AI分析"]
-    choice = st.sidebar.radio("メニューを選択してください", menu)
-    
-    # ------------------------------------------
-    # ダッシュボード
-    # ------------------------------------------
-    if choice == "ダッシュボード":
-        st.header("📊 ダッシュボード")
-        df = get_inventory_data()
-        
-        # 指標の計算
-        total_products = len(df)
-        total_stock = df['current_stock'].sum()
-        reorder_items = len(df[df['status'] == "要発注"])
-        
-        # 本日の入出庫
-        conn = get_connection()
-        today = datetime.now().strftime('%Y-%m-%d')
-        today_in = pd.read_sql(f"SELECT COUNT(*) as count FROM stock_transactions WHERE transaction_date = '{today}' AND transaction_type = 'IN'", conn).iloc[0]['count']
-        today_out = pd.read_sql(f"SELECT COUNT(*) as count FROM stock_transactions WHERE transaction_date = '{today}' AND transaction_type = 'OUT'", conn).iloc[0]['count']
+
+def get_product_options() -> pd.DataFrame:
+    conn = get_connection()
+    df = pd.read_sql(
+        "SELECT product_code, product_name FROM products ORDER BY product_code",
+        conn
+    )
+    conn.close()
+    return df
+
+
+# =========================================================
+# 入出庫関連
+# =========================================================
+def add_transaction(
+    transaction_date: str,
+    product_code: str,
+    transaction_type: str,
+    quantity: float,
+    partner: str,
+    staff: str,
+    remarks: str
+):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            INSERT INTO stock_transactions (
+                transaction_date, product_code, transaction_type,
+                quantity, partner, staff, remarks, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            transaction_date,
+            product_code,
+            transaction_type,
+            float(quantity),
+            partner.strip(),
+            staff.strip(),
+            remarks.strip(),
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ))
+        conn.commit()
+        return True, "登録しました。"
+    except Exception as e:
+        return False, f"登録中にエラーが発生しました: {e}"
+    finally:
         conn.close()
-        
-        col1, col2, col3, col4, col5 = st.columns(5)
-        col1.metric("登録商品数", f"{total_products} 点")
-        col2.metric("総在庫数", f"{int(total_stock)} 単位")
-        col3.metric("要発注商品", f"{reorder_items} 件", delta_color="inverse")
-        col4.metric("本日入庫", f"{today_in} 件")
-        col5.metric("本日出庫", f"{today_out} 件")
-        
-        st.subheader("⚠️ 要発注商品一覧")
-        if reorder_items > 0:
-            st.warning(f"現在 {reorder_items} 件の商品が最低在庫を下回っています。")
-            st.dataframe(df[df['status'] == "要発注"][['product_code', 'product_name', 'current_stock', 'min_stock', 'location']])
+
+
+def get_recent_transactions(limit: int = 10) -> pd.DataFrame:
+    conn = get_connection()
+    df = pd.read_sql(
+        """
+        SELECT
+            transaction_date,
+            product_code,
+            transaction_type,
+            quantity,
+            partner,
+            staff,
+            remarks
+        FROM stock_transactions
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+        """,
+        conn,
+        params=(limit,)
+    )
+    conn.close()
+    return df
+
+
+def get_today_transaction_counts():
+    today_str = date.today().strftime("%Y-%m-%d")
+    conn = get_connection()
+
+    in_df = pd.read_sql(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM stock_transactions
+        WHERE transaction_date = ? AND transaction_type = 'IN'
+        """,
+        conn,
+        params=(today_str,)
+    )
+
+    out_df = pd.read_sql(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM stock_transactions
+        WHERE transaction_date = ? AND transaction_type = 'OUT'
+        """,
+        conn,
+        params=(today_str,)
+    )
+
+    conn.close()
+    return int(in_df.iloc[0]["cnt"]), int(out_df.iloc[0]["cnt"])
+
+
+# =========================================================
+# 在庫計算
+# =========================================================
+def get_inventory_data() -> pd.DataFrame:
+    conn = get_connection()
+
+    df_products = pd.read_sql("SELECT * FROM products", conn)
+
+    if df_products.empty:
+        conn.close()
+        return pd.DataFrame()
+
+    df_in = pd.read_sql("""
+        SELECT product_code, SUM(quantity) AS total_in
+        FROM stock_transactions
+        WHERE transaction_type = 'IN'
+        GROUP BY product_code
+    """, conn)
+
+    df_out = pd.read_sql("""
+        SELECT product_code, SUM(quantity) AS total_out
+        FROM stock_transactions
+        WHERE transaction_type = 'OUT'
+        GROUP BY product_code
+    """, conn)
+
+    conn.close()
+
+    df = df_products.merge(df_in, on="product_code", how="left")
+    df = df.merge(df_out, on="product_code", how="left")
+
+    df["total_in"] = df["total_in"].fillna(0.0)
+    df["total_out"] = df["total_out"].fillna(0.0)
+    df["current_stock"] = df["total_in"] - df["total_out"]
+
+    def judge_status(row):
+        current_stock = float(row.get("current_stock", 0))
+        min_stock = float(row.get("min_stock", 0))
+        optimal_stock = float(row.get("optimal_stock", 0))
+
+        if current_stock <= min_stock:
+            return "要発注"
+        elif current_stock <= min_stock + 5:
+            return "注意"
+        elif optimal_stock > 0 and current_stock > optimal_stock * 1.5:
+            return "過剰在庫"
         else:
+            return "正常"
+
+    df["status"] = df.apply(judge_status, axis=1)
+
+    return df.sort_values(["status", "product_code"], ascending=[True, True])
+
+
+def get_low_stock_items(df_inventory: pd.DataFrame) -> pd.DataFrame:
+    if df_inventory.empty:
+        return pd.DataFrame()
+
+    return df_inventory[df_inventory["status"] == "要発注"].copy()
+
+
+# =========================================================
+# AI分析
+# =========================================================
+def generate_ai_advice(inventory_df: pd.DataFrame, low_stock_df: pd.DataFrame) -> str:
+    """
+    今はルールベース。
+    後でGemini APIに置き換えやすい形にしてある。
+    """
+    api_key = get_api_key()
+
+    # MVPではAPI未設定でも必ず動かす
+    if inventory_df.empty:
+        return "### 🤖 AI分析\n\nまだ分析できる在庫データがありません。"
+
+    total_items = len(inventory_df)
+    low_count = len(low_stock_df)
+    over_stock_df = inventory_df[inventory_df["status"] == "過剰在庫"]
+
+    advice_lines = []
+    advice_lines.append("### 🤖 AI在庫分析レポート")
+    advice_lines.append("")
+
+    if api_key:
+        advice_lines.append("Gemini APIキーが設定されています。")
+        advice_lines.append("現在はMVPのため、ルールベース分析で表示しています。")
+        advice_lines.append("今後ここにGemini連携を追加できます。")
+        advice_lines.append("")
+
+    advice_lines.append(f"- 登録商品数: **{total_items}件**")
+    advice_lines.append(f"- 要発注商品数: **{low_count}件**")
+    advice_lines.append(f"- 過剰在庫候補: **{len(over_stock_df)}件**")
+    advice_lines.append("")
+
+    if low_count > 0:
+        advice_lines.append("#### ⚠️ 要発注候補")
+        for _, row in low_stock_df.iterrows():
+            advice_lines.append(
+                f"- **{row['product_name']}**：現在庫 {format_number(row['current_stock'])} / 最低在庫 {format_number(row['min_stock'])}"
+            )
+        advice_lines.append("")
+        advice_lines.append("**提案:** 早めの補充や発注スケジュールの確認をおすすめします。")
+    else:
+        advice_lines.append("#### ✅ 在庫状況")
+        advice_lines.append("現在、最低在庫を下回っている商品はありません。")
+
+    if len(over_stock_df) > 0:
+        advice_lines.append("")
+        advice_lines.append("#### 📦 過剰在庫候補")
+        for _, row in over_stock_df.iterrows():
+            advice_lines.append(
+                f"- **{row['product_name']}**：現在庫 {format_number(row['current_stock'])} / 適正在庫 {format_number(row['optimal_stock'])}"
+            )
+        advice_lines.append("")
+        advice_lines.append("**提案:** 入庫調整や出庫促進を検討してください。")
+
+    advice_lines.append("")
+    advice_lines.append("---")
+    advice_lines.append("※ Gemini APIを使う場合は、ここを差し替えて自然言語分析を追加できます。")
+
+    return "\n".join(advice_lines)
+
+
+# =========================================================
+# 表示用
+# =========================================================
+def show_header():
+    st.title(f"📦 {APP_TITLE}")
+    st.caption("物流会社・倉庫業務向けのMVP在庫管理システム")
+
+
+def show_dashboard():
+    st.subheader("📊 ダッシュボード")
+
+    df_inventory = get_inventory_data()
+
+    if df_inventory.empty:
+        total_products = 0
+        total_stock = 0
+        reorder_items = 0
+    else:
+        total_products = len(df_inventory)
+        total_stock = df_inventory["current_stock"].sum()
+        reorder_items = len(df_inventory[df_inventory["status"] == "要発注"])
+
+    today_in, today_out = get_today_transaction_counts()
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("登録商品数", f"{total_products} 点")
+    col2.metric("総在庫数", f"{format_number(total_stock)} 単位")
+    col3.metric("要発注商品", f"{reorder_items} 件")
+    col4.metric("本日入庫", f"{today_in} 件")
+    col5.metric("本日出庫", f"{today_out} 件")
+
+    st.markdown("### ⚠️ 要発注商品一覧")
+    if df_inventory.empty:
+        st.info("まだ商品データがありません。")
+    else:
+        low_stock_df = get_low_stock_items(df_inventory)
+        if low_stock_df.empty:
             st.success("現在、要発注商品はありません。")
-            
-        # 入出庫サマリー (直近10件)
-        st.subheader("📝 直近の入出庫履歴")
-        conn = get_connection()
-        recent_logs = pd.read_sql("SELECT transaction_date, product_code, transaction_type, quantity, partner, staff FROM stock_transactions ORDER BY created_at DESC LIMIT 10", conn)
-        conn.close()
-        st.table(recent_logs)
+        else:
+            st.warning(f"現在 {len(low_stock_df)} 件の商品が最低在庫を下回っています。")
+            display_cols = ["product_code", "product_name", "current_stock", "min_stock", "location", "supplier"]
+            st.dataframe(low_stock_df[display_cols], use_container_width=True)
 
-    # ------------------------------------------
-    # 商品マスタ登録
-    # ------------------------------------------
+    st.markdown("### 📝 直近の入出庫履歴")
+    recent_logs = get_recent_transactions(10)
+    if recent_logs.empty:
+        st.info("まだ入出庫履歴はありません。")
+    else:
+        st.dataframe(recent_logs, use_container_width=True)
+
+    if not df_inventory.empty:
+        st.markdown("### 📈 商品別在庫数")
+        graph_df = df_inventory[["product_name", "current_stock", "status"]].copy()
+        fig = px.bar(
+            graph_df,
+            x="product_name",
+            y="current_stock",
+            color="status",
+            title="商品別在庫状況",
+            color_discrete_map={
+                "正常": "green",
+                "注意": "orange",
+                "要発注": "red",
+                "過剰在庫": "blue"
+            }
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def show_product_form():
+    st.subheader("🆕 商品マスタ登録")
+
+    with st.form("product_form", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            product_code = st.text_input("商品コード *", help="必須・重複不可")
+            product_name = st.text_input("商品名 *", help="必須")
+            category = st.selectbox("カテゴリ", ["食品", "日用品", "電化製品", "資材", "その他"])
+            unit = st.text_input("単位", value="pcs")
+
+        with col2:
+            location = st.text_input("保管場所")
+            min_stock = st.number_input("最低在庫数", min_value=0.0, value=10.0, step=1.0)
+            optimal_stock = st.number_input("適正在庫数", min_value=0.0, value=50.0, step=1.0)
+            supplier = st.text_input("仕入先")
+
+        remarks = st.text_area("備考")
+        submitted = st.form_submit_button("登録する")
+
+    if submitted:
+        if not product_code.strip() or not product_name.strip():
+            st.error("商品コードと商品名は必須です。")
+            return
+
+        if optimal_stock < min_stock:
+            st.error("適正在庫数は最低在庫数以上にしてください。")
+            return
+
+        success, message = add_product(
+            product_code=product_code,
+            product_name=product_name,
+            category=category,
+            unit=unit,
+            location=location,
+            min_stock=min_stock,
+            optimal_stock=optimal_stock,
+            supplier=supplier,
+            remarks=remarks
+        )
+
+        if success:
+            st.success(message)
+        else:
+            st.error(message)
+
+
+def show_product_list():
+    st.subheader("📋 商品一覧")
+
+    df = get_products()
+
+    if df.empty:
+        st.info("まだ商品が登録されていません。")
+        return
+
+    keyword = st.text_input("商品名または商品コードで検索")
+    if keyword:
+        df = df[
+            safe_contains(df["product_name"], keyword) |
+            safe_contains(df["product_code"], keyword)
+        ]
+
+    display_cols = [
+        "product_code", "product_name", "category", "unit",
+        "location", "min_stock", "optimal_stock", "supplier", "remarks"
+    ]
+    st.dataframe(df[display_cols], use_container_width=True)
+
+    st.download_button(
+        "CSVをダウンロード",
+        data=to_csv_bytes(df[display_cols]),
+        file_name="products.csv",
+        mime="text/csv"
+    )
+
+
+def show_inbound_form():
+    st.subheader("📥 入庫登録")
+
+    products = get_product_options()
+
+    if products.empty:
+        st.warning("先に商品マスタを登録してください。")
+        return
+
+    product_map = {
+        f"{row['product_code']} : {row['product_name']}": row["product_code"]
+        for _, row in products.iterrows()
+    }
+
+    with st.form("inbound_form", clear_on_submit=True):
+        transaction_date = st.date_input("入庫日", value=date.today())
+        selected_product = st.selectbox("商品を選択", list(product_map.keys()))
+        product_code = product_map[selected_product]
+        quantity = st.number_input("数量", min_value=1.0, value=1.0, step=1.0)
+        partner = st.text_input("入庫元（仕入先など）")
+        staff = st.text_input("担当者")
+        remarks = st.text_area("備考")
+
+        submitted = st.form_submit_button("入庫を確定する")
+
+    if submitted:
+        success, message = add_transaction(
+            transaction_date=str(transaction_date),
+            product_code=product_code,
+            transaction_type="IN",
+            quantity=quantity,
+            partner=partner,
+            staff=staff,
+            remarks=remarks
+        )
+        if success:
+            st.success(f"入庫を登録しました。 商品コード: {product_code} / 数量: {format_number(quantity)}")
+        else:
+            st.error(message)
+
+
+def show_outbound_form():
+    st.subheader("📤 出庫登録")
+
+    df_inventory = get_inventory_data()
+
+    if df_inventory.empty:
+        st.warning("先に商品マスタを登録してください。")
+        return
+
+    product_map = {
+        f"{row['product_code']} : {row['product_name']}（現在庫: {format_number(row['current_stock'])}）": row["product_code"]
+        for _, row in df_inventory.iterrows()
+    }
+
+    with st.form("outbound_form", clear_on_submit=True):
+        transaction_date = st.date_input("出庫日", value=date.today())
+        selected_product = st.selectbox("商品を選択", list(product_map.keys()))
+        product_code = product_map[selected_product]
+
+        current_stock = float(
+            df_inventory.loc[df_inventory["product_code"] == product_code, "current_stock"].iloc[0]
+        )
+        st.info(f"現在庫: {format_number(current_stock)}")
+
+        quantity = st.number_input("数量", min_value=1.0, value=1.0, step=1.0)
+        partner = st.text_input("出庫先（顧客など）")
+        staff = st.text_input("担当者")
+        remarks = st.text_area("備考")
+
+        submitted = st.form_submit_button("出庫を確定する")
+
+    if submitted:
+        if quantity > current_stock:
+            st.error(f"在庫不足です。現在庫は {format_number(current_stock)} です。")
+            return
+
+        success, message = add_transaction(
+            transaction_date=str(transaction_date),
+            product_code=product_code,
+            transaction_type="OUT",
+            quantity=quantity,
+            partner=partner,
+            staff=staff,
+            remarks=remarks
+        )
+        if success:
+            st.success(f"出庫を登録しました。 商品コード: {product_code} / 数量: {format_number(quantity)}")
+        else:
+            st.error(message)
+
+
+def show_inventory_list():
+    st.subheader("📦 在庫一覧")
+
+    df = get_inventory_data()
+
+    if df.empty:
+        st.info("まだ在庫データがありません。")
+        return
+
+    keyword = st.text_input("商品名または商品コードで検索")
+    if keyword:
+        df = df[
+            safe_contains(df["product_name"], keyword) |
+            safe_contains(df["product_code"], keyword)
+        ]
+
+    display_df = df[
+        ["product_code", "product_name", "category", "location", "current_stock", "min_stock", "optimal_stock", "status"]
+    ].copy()
+
+    def highlight_row(row):
+        if row["status"] == "要発注":
+            return ["background-color: #ffd6d6"] * len(row)
+        elif row["status"] == "注意":
+            return ["background-color: #fff3cd"] * len(row)
+        elif row["status"] == "過剰在庫":
+            return ["background-color: #d6ecff"] * len(row)
+        return [""] * len(row)
+
+    st.dataframe(
+        display_df.style.apply(highlight_row, axis=1),
+        use_container_width=True
+    )
+
+    st.download_button(
+        "在庫データをCSVで保存",
+        data=to_csv_bytes(display_df),
+        file_name="inventory_status.csv",
+        mime="text/csv"
+    )
+
+
+def show_ai_analysis():
+    st.subheader("🤖 AI在庫分析アドバイザー")
+
+    df_inventory = get_inventory_data()
+
+    if df_inventory.empty:
+        st.info("分析するためのデータがまだありません。")
+        return
+
+    low_stock_df = get_low_stock_items(df_inventory)
+
+    with st.spinner("AIがデータを分析中..."):
+        advice = generate_ai_advice(df_inventory, low_stock_df)
+
+    st.markdown(advice)
+
+    st.markdown("### 📈 在庫状況グラフ")
+    fig = px.bar(
+        df_inventory,
+        x="product_name",
+        y="current_stock",
+        color="status",
+        title="商品別在庫数とステータス",
+        color_discrete_map={
+            "正常": "green",
+            "注意": "orange",
+            "要発注": "red",
+            "過剰在庫": "blue"
+        }
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    if get_api_key():
+        st.success("GEMINI_API_KEY が設定されています。今後API連携を追加できます。")
+    else:
+        st.warning("GEMINI_API_KEY は未設定です。現在は簡易分析モードで動作しています。")
+
+
+# =========================================================
+# メイン
+# =========================================================
+def main():
+    init_db()
+    show_header()
+
+    st.sidebar.title("📦 在庫管理メニュー")
+    menu = [
+        "ダッシュボード",
+        "商品マスタ登録",
+        "商品一覧",
+        "入庫登録",
+        "出庫登録",
+        "在庫一覧",
+        "AI分析"
+    ]
+    choice = st.sidebar.radio("メニューを選択してください", menu)
+
+    if choice == "ダッシュボード":
+        show_dashboard()
     elif choice == "商品マスタ登録":
-        st.header("🆕 商品マスタ登録")
-        with st.form("product_form"):
-            col1, col2 = st.columns(2)
-            with col1:
-                p_code = st.text_input("商品コード *", help="必須項目・重複不可")
-                p_name = st.text_input("商品名 *", help="必須項目")
-                category = st.selectbox("カテゴリ", ["食品", "日用品", "電化製品", "資材", "その他"])
-                unit = st.text_input("単位", value="pcs")
-            with col2:
-                location = st.text_input("保管場所")
-                min_stock = st.number_input("最低在庫数", min_value=0.0, value=10.0)
-                optimal_stock = st.number_input("適正在庫数", min_value=0.0, value=50.0)
-                supplier = st.text_input("仕入先")
-            
-            remarks = st.text_area("備考")
-            submitted = st.form_submit_button("登録する")
-            
-            if submitted:
-                if not p_code or not p_name:
-                    st.error("商品コードと商品名は必須です。")
-                else:
-                    try:
-                        conn = get_connection()
-                        c = conn.cursor()
-                        c.execute('''
-                            INSERT INTO products (product_code, product_name, category, unit, location, min_stock, optimal_stock, supplier, remarks)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ''', (p_code, p_name, category, unit, location, min_stock, optimal_stock, supplier, remarks))
-                        conn.commit()
-                        conn.close()
-                        st.success(f"商品「{p_name}」を登録しました。")
-                    except sqlite3.IntegrityError:
-                        st.error("この商品コードは既に登録されています。")
-
-    # ------------------------------------------
-    # 商品一覧
-    # ------------------------------------------
+        show_product_form()
     elif choice == "商品一覧":
-        st.header("📋 商品一覧")
-        conn = get_connection()
-        df = pd.read_sql("SELECT * FROM products", conn)
-        conn.close()
-        
-        search = st.text_input("商品名またはコードで検索")
-        if search:
-            df = df[df['product_name'].str.contains(search) | df['product_code'].str.contains(search)]
-            
-        st.dataframe(df)
-        
-        # CSVダウンロード
-        csv = df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("CSVをダウンロード", csv, "products.csv", "text/csv")
-
-    # ------------------------------------------
-    # 入庫登録
-    # ------------------------------------------
+        show_product_list()
     elif choice == "入庫登録":
-        st.header("📥 入庫登録")
-        conn = get_connection()
-        products = pd.read_sql("SELECT product_code, product_name FROM products", conn)
-        conn.close()
-        
-        if products.empty:
-            st.warning("先に商品マスタを登録してください。")
-        else:
-            with st.form("in_form"):
-                t_date = st.date_input("入庫日", value=datetime.now())
-                p_options = products.apply(lambda x: f"{x['product_code']} : {x['product_name']}", axis=1).tolist()
-                selected_p = st.selectbox("商品コードを選択", p_options)
-                p_code = selected_p.split(" : ")[0]
-                
-                quantity = st.number_input("数量", min_value=1.0, value=1.0)
-                partner = st.text_input("入庫元 (仕入先等)")
-                staff = st.text_input("担当者")
-                remarks = st.text_area("備考")
-                
-                submitted = st.form_submit_button("入庫を確定する")
-                
-                if submitted:
-                    conn = get_connection()
-                    c = conn.cursor()
-                    c.execute('''
-                        INSERT INTO stock_transactions (transaction_date, product_code, transaction_type, quantity, partner, staff, remarks)
-                        VALUES (?, ?, 'IN', ?, ?, ?, ?)
-                    ''', (t_date, p_code, quantity, partner, staff, remarks))
-                    conn.commit()
-                    conn.close()
-                    st.success(f"入庫を完了しました。({p_code} : {quantity})")
-
-    # ------------------------------------------
-    # 出庫登録
-    # ------------------------------------------
+        show_inbound_form()
     elif choice == "出庫登録":
-        st.header("📤 出庫登録")
-        df_inv = get_inventory_data()
-        
-        if df_inv.empty:
-            st.warning("先に商品マスタを登録してください。")
-        else:
-            with st.form("out_form"):
-                t_date = st.date_input("出庫日", value=datetime.now())
-                p_options = df_inv.apply(lambda x: f"{x['product_code']} : {x['product_name']} (現在庫: {x['current_stock']})", axis=1).tolist()
-                selected_p = st.selectbox("商品コードを選択", p_options)
-                p_code = selected_p.split(" : ")[0]
-                
-                # 現在庫の取得
-                current_stock = df_inv[df_inv['product_code'] == p_code]['current_stock'].values[0]
-                
-                quantity = st.number_input("数量", min_value=1.0, value=1.0)
-                partner = st.text_input("出庫先 (顧客等)")
-                staff = st.text_input("担当者")
-                remarks = st.text_area("備考")
-                
-                submitted = st.form_submit_button("出庫を確定する")
-                
-                if submitted:
-                    if quantity > current_stock:
-                        st.error(f"在庫不足です。現在の在庫は {current_stock} です。")
-                    else:
-                        conn = get_connection()
-                        c = conn.cursor()
-                        c.execute('''
-                            INSERT INTO stock_transactions (transaction_date, product_code, transaction_type, quantity, partner, staff, remarks)
-                            VALUES (?, ?, 'OUT', ?, ?, ?, ?)
-                        ''', (t_date, p_code, quantity, partner, staff, remarks))
-                        conn.commit()
-                        conn.close()
-                        st.success(f"出庫を完了しました。({p_code} : {quantity})")
-
-    # ------------------------------------------
-    # 在庫一覧
-    # ------------------------------------------
+        show_outbound_form()
     elif choice == "在庫一覧":
-        st.header("📦 在庫一覧")
-        df = get_inventory_data()
-        
-        search = st.text_input("商品名またはコードで検索")
-        if search:
-            df = df[df['product_name'].str.contains(search) | df['product_code'].str.contains(search)]
-            
-        # 表示項目の整理
-        display_df = df[['product_code', 'product_name', 'category', 'location', 'current_stock', 'min_stock', 'optimal_stock', 'status']]
-        
-        # スタイル適用 (要発注を赤くするなど)
-        def color_status(val):
-            color = 'red' if val == '要発注' else ('orange' if val == '注意' else 'black')
-            return f'color: {color}'
-            
-        st.dataframe(display_df.style.applymap(color_status, subset=['status']))
-        
-        # CSVダウンロード
-        csv = display_df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("在庫データをCSVで保存", csv, "inventory_status.csv", "text/csv")
-
-    # ------------------------------------------
-    # AI分析
-    # ------------------------------------------
+        show_inventory_list()
     elif choice == "AI分析":
-        st.header("🤖 AI在庫分析アドバイザー")
-        df = get_inventory_data()
-        low_stock_df = df[df['status'] == "要発注"]
-        
-        if df.empty:
-            st.info("分析するためのデータがまだありません。")
-        else:
-            with st.spinner("AIがデータを分析中..."):
-                advice = generate_ai_advice(df, low_stock_df)
-                st.markdown(advice)
-            
-            # 視覚化
-            st.subheader("📈 在庫状況グラフ")
-            import plotly.express as px
-            fig = px.bar(df, x='product_name', y='current_stock', color='status', 
-                         title="商品別在庫数とステータス",
-                         color_discrete_map={'正常': 'green', '注意': 'orange', '要発注': 'red'})
-            st.plotly_chart(fig, use_container_width=True)
+        show_ai_analysis()
+
 
 if __name__ == "__main__":
     main()
