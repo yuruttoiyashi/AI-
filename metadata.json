@@ -1,0 +1,5 @@
+{
+  "name": "AI在庫管理システム MVP",
+  "description": "物流会社向けのAIを活用した在庫管理アプリ。SQLiteを使用し、AI分析機能を搭載。",
+  "requestFramePermissions": []
+}
