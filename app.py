@@ -3,11 +3,11 @@ import sqlite3
 from datetime import datetime, date
 from pathlib import Path
 from io import StringIO
-from openai import OpenAI
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from openai import OpenAI
 
 
 # =========================================================
@@ -31,12 +31,12 @@ DB_PATH = DB_DIR / "inventory.db"
 def get_api_key() -> str:
     """Streamlit secrets → 環境変数 の順で取得"""
     try:
-        api_key = st.secrets.get("GEMINI_API_KEY", "")
+        api_key = st.secrets.get("OPENAI_API_KEY", "")
     except Exception:
         api_key = ""
 
     if not api_key:
-        api_key = os.getenv("GEMINI_API_KEY", "")
+        api_key = os.getenv("OPENAI_API_KEY", "")
 
     return api_key
 
@@ -796,14 +796,12 @@ def generate_ai_advice(inventory_df: pd.DataFrame, low_stock_df: pd.DataFrame) -
     if inventory_df.empty:
         return "### 🤖 AI分析\n\nまだ分析できる在庫データがありません。"
 
-    # OpenAI用に送るデータを絞る
     inventory_summary_df = inventory_df[
         ["product_code", "product_name", "current_stock", "min_stock", "optimal_stock", "status"]
     ].copy()
 
     inventory_summary = inventory_summary_df.to_csv(index=False)
 
-    # プロンプト作成
     prompt = f"""
 あなたは物流会社の在庫管理アドバイザーです。
 以下の在庫データを見て、日本語でわかりやすく分析してください。
@@ -828,13 +826,11 @@ def generate_ai_advice(inventory_df: pd.DataFrame, low_stock_df: pd.DataFrame) -
             input=prompt
         )
 
-        # SDKの戻り値から本文を安全に取り出す
         output_text = getattr(response, "output_text", None)
 
         if output_text and str(output_text).strip():
             return output_text
 
-        # 念のためのフォールバック
         return "### 🤖 AI分析\n\nAIからの応答はありましたが、本文を取得できませんでした。"
 
     except Exception as e:
@@ -847,6 +843,7 @@ OpenAI APIの呼び出し中にエラーが発生しました。
 
 現在は簡易分析モードでの利用をおすすめします。
 """
+
 
 # =========================================================
 # 表示用
@@ -1288,9 +1285,9 @@ def show_ai_analysis():
     st.plotly_chart(fig, use_container_width=True)
 
     if get_api_key():
-        st.success("GEMINI_API_KEY が設定されています。今後API連携を追加できます。")
+        st.success("OPENAI_API_KEY が設定されています。AI分析を利用できます。")
     else:
-        st.warning("GEMINI_API_KEY は未設定です。現在は簡易分析モードで動作しています。")
+        st.warning("OPENAI_API_KEY は未設定です。現在は簡易分析モードで動作しています。")
 
 
 # =========================================================
