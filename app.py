@@ -2,6 +2,7 @@ import os
 import sqlite3
 from datetime import datetime, date
 from pathlib import Path
+from io import StringIO
 
 import pandas as pd
 import plotly.express as px
@@ -27,6 +28,7 @@ DB_PATH = DB_DIR / "inventory.db"
 # APIキー取得
 # =========================================================
 def get_api_key() -> str:
+    """Streamlit secrets → 環境変数 の順で取得"""
     try:
         api_key = st.secrets.get("GEMINI_API_KEY", "")
     except Exception:
@@ -113,18 +115,16 @@ def normalize_date_string(value) -> str:
     except Exception:
         raise ValueError("日付の形式が不正です。YYYY-MM-DD 形式推奨です。")
 
-from io import StringIO
 
 def read_flexible_csv(uploaded_file) -> pd.DataFrame:
     """
-    かなり強めにCSVを読む関数
+    強めのCSV読み込み
     - utf-8-sig / utf-8 / cp932 / shift_jis 対応
     - , / ; / タブ / 全角カンマ 対応
     - 1列で読まれた場合は手動splitで救済
     """
     raw = uploaded_file.getvalue()
 
-    # 文字コード候補
     encodings = ["utf-8-sig", "utf-8", "cp932", "shift_jis"]
     text = None
 
@@ -138,10 +138,8 @@ def read_flexible_csv(uploaded_file) -> pd.DataFrame:
     if text is None:
         raise ValueError("CSVの文字コードを読み取れませんでした。utf-8 または cp932 で保存してください。")
 
-    # 改行コードを統一
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    # まず普通に候補区切りで読む
     candidates = [",", ";", "\t", "，"]
     best_df = None
     best_cols = 0
@@ -155,20 +153,14 @@ def read_flexible_csv(uploaded_file) -> pd.DataFrame:
         except Exception:
             pass
 
-    # 普通に複数列で読めたらそれを返す
     if best_df is not None and best_cols > 1:
         return best_df
 
-    # -----------------------------
-    # ここから救済処理
-    # 「1列で読まれたCSV」を手動で分解する
-    # -----------------------------
+    # 1列で読まれた場合の救済
     lines = [line.strip() for line in text.split("\n") if line.strip()]
-
     if not lines:
         raise ValueError("CSVが空です。")
 
-    # 区切り文字を推定
     sep = None
     for candidate in [",", ";", "\t", "，"]:
         if candidate in lines[0]:
@@ -179,16 +171,15 @@ def read_flexible_csv(uploaded_file) -> pd.DataFrame:
         raise ValueError("CSVの区切り文字を判定できませんでした。半角カンマ区切りで保存してください。")
 
     split_rows = [line.split(sep) for line in lines]
-
-    # 列数を揃える
     max_len = max(len(row) for row in split_rows)
     split_rows = [row + [""] * (max_len - len(row)) for row in split_rows]
 
     header = [col.strip() for col in split_rows[0]]
     data_rows = [[cell.strip() for cell in row] for row in split_rows[1:]]
 
-    df = pd.DataFrame(data_rows, columns=header)
-    return df
+    return pd.DataFrame(data_rows, columns=header)
+
+
 # =========================================================
 # テンプレートCSV
 # =========================================================
@@ -947,6 +938,7 @@ def show_product_csv_import():
             else:
                 st.error(message)
 
+
 def show_product_list():
     st.subheader("📋 商品一覧")
 
@@ -977,46 +969,31 @@ def show_product_list():
     )
 
 
-def show_inbound_csv_import():
-    st.subheader("📥 入庫CSV一括取込")
+def show_inbound_form():
+    st.subheader("📥 入庫登録")
 
-    st.markdown("### ① テンプレートをダウンロード")
-    template_df = get_inbound_template_df()
-    st.download_button(
-        "入庫CSVテンプレートをダウンロード",
-        data=to_csv_bytes(template_df),
-        file_name="inbound_template.csv",
-        mime="text/csv"
-    )
+    products = get_product_options()
 
-    st.markdown("### ② CSVをアップロード")
-    uploaded_file = st.file_uploader(
-        "入庫CSVを選択してください",
-        type=["csv"],
-        key="inbound_csv"
-    )
+    if products.empty:
+        st.warning("先に商品マスタを登録してください。")
+        return
 
-    if uploaded_file is not None:
-        try:
-            df_csv = read_flexible_csv(uploaded_file)
-        except Exception as e:
-            st.error(f"CSV読み込みエラー: {e}")
-            return
+    product_map = {
+        f"{row['product_code']} : {row['product_name']}": row["product_code"]
+        for _, row in products.iterrows()
+    }
 
-        st.markdown("### ③ 読み込み内容プレビュー")
-        st.dataframe(df_csv, use_container_width=True)
+    with st.form("inbound_form", clear_on_submit=True):
+        transaction_date = st.date_input("入庫日", value=date.today())
+        selected_product = st.selectbox("商品を選択", list(product_map.keys()))
+        product_code = product_map[selected_product]
+        quantity = st.number_input("数量", min_value=1.0, value=1.0, step=1.0)
+        partner = st.text_input("入庫元（仕入先など）")
+        staff = st.text_input("担当者")
+        remarks = st.text_area("備考")
 
-        if st.button("この入庫CSVを取り込む"):
-            success, message, errors = import_inbound_from_csv(df_csv)
+        submitted = st.form_submit_button("入庫を確定する")
 
-            if success:
-                st.success(message)
-                if errors:
-                    st.warning("一部エラーがあります。詳細を確認してください。")
-                    for err in errors:
-                        st.write(f"- {err}")
-            else:
-                st.error(message)
     if submitted:
         success, message = add_transaction(
             transaction_date=str(transaction_date),
@@ -1053,11 +1030,15 @@ def show_inbound_csv_import():
     )
 
     if uploaded_file is not None:
-    try:
-        df_csv = read_flexible_csv(uploaded_file)
-    except Exception as e:
-        st.error(f"CSV読み込みエラー: {e}")
-        return
+        try:
+            df_csv = read_flexible_csv(uploaded_file)
+        except Exception as e:
+            st.error(f"CSV読み込みエラー: {e}")
+            return
+
+        st.markdown("### ③ 読み込み内容プレビュー")
+        st.dataframe(df_csv, use_container_width=True)
+
         if st.button("この入庫CSVを取り込む"):
             success, message, errors = import_inbound_from_csv(df_csv)
 
@@ -1069,6 +1050,57 @@ def show_inbound_csv_import():
                         st.write(f"- {err}")
             else:
                 st.error(message)
+
+
+def show_outbound_form():
+    st.subheader("📤 出庫登録")
+
+    df_inventory = get_inventory_data()
+
+    if df_inventory.empty:
+        st.warning("先に商品マスタを登録してください。")
+        return
+
+    product_map = {
+        f"{row['product_code']} : {row['product_name']}（現在庫: {format_number(row['current_stock'])}）": row["product_code"]
+        for _, row in df_inventory.iterrows()
+    }
+
+    with st.form("outbound_form", clear_on_submit=True):
+        transaction_date = st.date_input("出庫日", value=date.today())
+        selected_product = st.selectbox("商品を選択", list(product_map.keys()))
+        product_code = product_map[selected_product]
+
+        current_stock = float(
+            df_inventory.loc[df_inventory["product_code"] == product_code, "current_stock"].iloc[0]
+        )
+        st.info(f"現在庫: {format_number(current_stock)}")
+
+        quantity = st.number_input("数量", min_value=1.0, value=1.0, step=1.0)
+        partner = st.text_input("出庫先（顧客など）")
+        staff = st.text_input("担当者")
+        remarks = st.text_area("備考")
+
+        submitted = st.form_submit_button("出庫を確定する")
+
+    if submitted:
+        if quantity > current_stock:
+            st.error(f"在庫不足です。現在庫は {format_number(current_stock)} です。")
+            return
+
+        success, message = add_transaction(
+            transaction_date=str(transaction_date),
+            product_code=product_code,
+            transaction_type="OUT",
+            quantity=quantity,
+            partner=partner,
+            staff=staff,
+            remarks=remarks
+        )
+        if success:
+            st.success(f"出庫を登録しました。 商品コード: {product_code} / 数量: {format_number(quantity)}")
+        else:
+            st.error(message)
 
 
 def show_outbound_csv_import():
@@ -1099,44 +1131,6 @@ def show_outbound_csv_import():
 
         st.markdown("### ③ 読み込み内容プレビュー")
         st.dataframe(df_csv, use_container_width=True)
-
-        if st.button("この出庫CSVを取り込む"):
-            success, message, errors = import_outbound_from_csv(df_csv)
-
-            if success:
-                st.success(message)
-                if errors:
-                    st.warning("一部エラーがあります。詳細を確認してください。")
-                    for err in errors:
-                        st.write(f"- {err}")
-            else:
-                st.error(message)
-
-def show_outbound_csv_import():
-    st.subheader("📤 出庫CSV一括取込")
-
-    st.markdown("### ① テンプレートをダウンロード")
-    template_df = get_outbound_template_df()
-    st.download_button(
-        "出庫CSVテンプレートをダウンロード",
-        data=to_csv_bytes(template_df),
-        file_name="outbound_template.csv",
-        mime="text/csv"
-    )
-
-    st.markdown("### ② CSVをアップロード")
-    uploaded_file = st.file_uploader(
-        "出庫CSVを選択してください",
-        type=["csv"],
-        key="outbound_csv"
-    )
-
-    if uploaded_file is not None:
-    try:
-        df_csv = read_flexible_csv(uploaded_file)
-    except Exception as e:
-        st.error(f"CSV読み込みエラー: {e}")
-        return
 
         if st.button("この出庫CSVを取り込む"):
             success, message, errors = import_outbound_from_csv(df_csv)
