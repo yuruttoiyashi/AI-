@@ -178,7 +178,26 @@ def read_flexible_csv(uploaded_file) -> pd.DataFrame:
     data_rows = [[cell.strip() for cell in row] for row in split_rows[1:]]
 
     return pd.DataFrame(data_rows, columns=header)
+def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    列名や値に混ざった不要なダブルクォーテーションや空白を除去する
+    """
+    df = df.copy()
 
+    # 列名を掃除
+    df.columns = [
+        str(col).replace("\ufeff", "").replace('"', "").replace("'", "").strip()
+        for col in df.columns
+    ]
+
+    # 各セルの文字列も掃除
+    for col in df.columns:
+        df[col] = df[col].apply(
+            lambda x: str(x).replace("\ufeff", "").replace('"', "").replace("'", "").strip()
+            if pd.notna(x) else x
+        )
+
+    return df
 
 # =========================================================
 # テンプレートCSV
@@ -1030,27 +1049,27 @@ def show_inbound_csv_import():
     )
 
     if uploaded_file is not None:
-        try:
-            df_csv = read_flexible_csv(uploaded_file)
-        except Exception as e:
-            st.error(f"CSV読み込みエラー: {e}")
-            return
+    try:
+        df_csv = read_flexible_csv(uploaded_file)
+        df_csv = clean_dataframe(df_csv)
+    except Exception as e:
+        st.error(f"CSV読み込みエラー: {e}")
+        return
 
-        st.markdown("### ③ 読み込み内容プレビュー")
-        st.dataframe(df_csv, use_container_width=True)
+    st.markdown("### ③ 読み込み内容プレビュー")
+    st.dataframe(df_csv, use_container_width=True)
 
-        if st.button("この入庫CSVを取り込む"):
-            success, message, errors = import_inbound_from_csv(df_csv)
+    if st.button("この入庫CSVを取り込む"):
+        success, message, errors = import_inbound_from_csv(df_csv)
 
-            if success:
-                st.success(message)
-                if errors:
-                    st.warning("一部エラーがあります。詳細を確認してください。")
-                    for err in errors:
-                        st.write(f"- {err}")
-            else:
-                st.error(message)
-
+        if success:
+            st.success(message)
+            if errors:
+                st.warning("一部エラーがあります。詳細を確認してください。")
+                for err in errors:
+                    st.write(f"- {err}")
+        else:
+            st.error(message)
 
 def show_outbound_form():
     st.subheader("📤 出庫登録")
@@ -1123,27 +1142,27 @@ def show_outbound_csv_import():
     )
 
     if uploaded_file is not None:
-        try:
-            df_csv = read_flexible_csv(uploaded_file)
-        except Exception as e:
-            st.error(f"CSV読み込みエラー: {e}")
-            return
+    try:
+        df_csv = read_flexible_csv(uploaded_file)
+        df_csv = clean_dataframe(df_csv)
+    except Exception as e:
+        st.error(f"CSV読み込みエラー: {e}")
+        return
 
-        st.markdown("### ③ 読み込み内容プレビュー")
-        st.dataframe(df_csv, use_container_width=True)
+    st.markdown("### ③ 読み込み内容プレビュー")
+    st.dataframe(df_csv, use_container_width=True)
 
-        if st.button("この出庫CSVを取り込む"):
-            success, message, errors = import_outbound_from_csv(df_csv)
+    if st.button("この出庫CSVを取り込む"):
+        success, message, errors = import_outbound_from_csv(df_csv)
 
-            if success:
-                st.success(message)
-                if errors:
-                    st.warning("一部エラーがあります。詳細を確認してください。")
-                    for err in errors:
-                        st.write(f"- {err}")
-            else:
-                st.error(message)
-
+        if success:
+            st.success(message)
+            if errors:
+                st.warning("一部エラーがあります。詳細を確認してください。")
+                for err in errors:
+                    st.write(f"- {err}")
+        else:
+            st.error(message)
 
 def show_inventory_list():
     st.subheader("📦 在庫一覧")
