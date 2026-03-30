@@ -113,13 +113,18 @@ def normalize_date_string(value) -> str:
     except Exception:
         raise ValueError("日付の形式が不正です。YYYY-MM-DD 形式推奨です。")
 
+from io import StringIO
+
 def read_flexible_csv(uploaded_file) -> pd.DataFrame:
     """
-    区切り文字を自動判定しながらCSVを読む
-    , / ， / ; / タブ に対応
+    かなり強めにCSVを読む関数
+    - utf-8-sig / utf-8 / cp932 / shift_jis 対応
+    - , / ; / タブ / 全角カンマ 対応
+    - 1列で読まれた場合は手動splitで救済
     """
     raw = uploaded_file.getvalue()
 
+    # 文字コード候補
     encodings = ["utf-8-sig", "utf-8", "cp932", "shift_jis"]
     text = None
 
@@ -133,15 +138,16 @@ def read_flexible_csv(uploaded_file) -> pd.DataFrame:
     if text is None:
         raise ValueError("CSVの文字コードを読み取れませんでした。utf-8 または cp932 で保存してください。")
 
-    # よくある区切り文字候補を試す
-    candidates = [",", "，", ";", "\t"]
+    # 改行コードを統一
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
 
+    # まず普通に候補区切りで読む
+    candidates = [",", ";", "\t", "，"]
     best_df = None
     best_cols = 0
 
     for sep in candidates:
         try:
-            from io import StringIO
             df = pd.read_csv(StringIO(text), sep=sep)
             if df.shape[1] > best_cols:
                 best_df = df
@@ -149,10 +155,40 @@ def read_flexible_csv(uploaded_file) -> pd.DataFrame:
         except Exception:
             pass
 
-    if best_df is None or best_cols <= 1:
-        raise ValueError("CSVの列区切りを判定できませんでした。半角カンマ区切りで保存してください。")
+    # 普通に複数列で読めたらそれを返す
+    if best_df is not None and best_cols > 1:
+        return best_df
 
-    return best_df
+    # -----------------------------
+    # ここから救済処理
+    # 「1列で読まれたCSV」を手動で分解する
+    # -----------------------------
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+
+    if not lines:
+        raise ValueError("CSVが空です。")
+
+    # 区切り文字を推定
+    sep = None
+    for candidate in [",", ";", "\t", "，"]:
+        if candidate in lines[0]:
+            sep = candidate
+            break
+
+    if sep is None:
+        raise ValueError("CSVの区切り文字を判定できませんでした。半角カンマ区切りで保存してください。")
+
+    split_rows = [line.split(sep) for line in lines]
+
+    # 列数を揃える
+    max_len = max(len(row) for row in split_rows)
+    split_rows = [row + [""] * (max_len - len(row)) for row in split_rows]
+
+    header = [col.strip() for col in split_rows[0]]
+    data_rows = [[cell.strip() for cell in row] for row in split_rows[1:]]
+
+    df = pd.DataFrame(data_rows, columns=header)
+    return df
 # =========================================================
 # テンプレートCSV
 # =========================================================
