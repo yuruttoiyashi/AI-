@@ -167,17 +167,28 @@ def read_flexible_csv(uploaded_file) -> pd.DataFrame:
             sep = candidate
             break
 
-    if sep is None:
-        raise ValueError("CSVの区切り文字を判定できませんでした。半角カンマ区切りで保存してください。")
+    if uploaded_file is not None:
+    try:
+        df_csv = read_flexible_csv(uploaded_file)
+        df_csv = clean_dataframe(df_csv)
+    except Exception as e:
+        st.error(f"CSV読み込みエラー: {e}")
+        return
 
-    split_rows = [line.split(sep) for line in lines]
-    max_len = max(len(row) for row in split_rows)
-    split_rows = [row + [""] * (max_len - len(row)) for row in split_rows]
+    st.markdown("### ③ 読み込み内容プレビュー")
+    st.dataframe(df_csv, use_container_width=True)
 
-    header = [col.strip() for col in split_rows[0]]
-    data_rows = [[cell.strip() for cell in row] for row in split_rows[1:]]
+    if st.button("この商品マスタCSVを取り込む"):
+        success, message, errors = import_products_from_csv(df_csv)
 
-    return pd.DataFrame(data_rows, columns=header)
+        if success:
+            st.success(message)
+            if errors:
+                st.warning("一部エラーがあります。詳細を確認してください。")
+                for err in errors:
+                    st.write(f"- {err}")
+        else:
+            st.error(message)
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """
     列名や値に混ざった不要なダブルクォーテーションや空白を除去する
