@@ -3,6 +3,7 @@ import sqlite3
 from datetime import datetime, date
 from pathlib import Path
 from io import StringIO
+from openai import OpenAI
 
 import pandas as pd
 import plotly.express as px
@@ -750,56 +751,102 @@ def get_low_stock_items(df_inventory: pd.DataFrame) -> pd.DataFrame:
 def generate_ai_advice(inventory_df: pd.DataFrame, low_stock_df: pd.DataFrame) -> str:
     api_key = get_api_key()
 
+    # APIキーがない場合は簡易分析
+    if not api_key:
+        if inventory_df.empty:
+            return "### 🤖 AI分析\n\nまだ分析できる在庫データがありません。"
+
+        total_items = len(inventory_df)
+        low_count = len(low_stock_df)
+        over_stock_df = inventory_df[inventory_df["status"] == "過剰在庫"]
+
+        advice_lines = []
+        advice_lines.append("### 🤖 AI在庫分析レポート（簡易モード）")
+        advice_lines.append("")
+        advice_lines.append(f"- 登録商品数: **{total_items}件**")
+        advice_lines.append(f"- 要発注商品数: **{low_count}件**")
+        advice_lines.append(f"- 過剰在庫候補: **{len(over_stock_df)}件**")
+        advice_lines.append("")
+
+        if low_count > 0:
+            advice_lines.append("#### ⚠️ 要発注候補")
+            for _, row in low_stock_df.iterrows():
+                advice_lines.append(
+                    f"- **{row['product_name']}**：現在庫 {format_number(row['current_stock'])} / 最低在庫 {format_number(row['min_stock'])}"
+                )
+            advice_lines.append("")
+            advice_lines.append("**提案:** 早めの補充や発注スケジュール確認をおすすめします。")
+        else:
+            advice_lines.append("#### ✅ 在庫状況")
+            advice_lines.append("現在、最低在庫を下回っている商品はありません。")
+
+        if len(over_stock_df) > 0:
+            advice_lines.append("")
+            advice_lines.append("#### 📦 過剰在庫候補")
+            for _, row in over_stock_df.iterrows():
+                advice_lines.append(
+                    f"- **{row['product_name']}**：現在庫 {format_number(row['current_stock'])} / 適正在庫 {format_number(row['optimal_stock'])}"
+                )
+            advice_lines.append("")
+            advice_lines.append("**提案:** 入庫調整や出庫促進を検討してください。")
+
+        return "\n".join(advice_lines)
+
+    # データが空なら終了
     if inventory_df.empty:
         return "### 🤖 AI分析\n\nまだ分析できる在庫データがありません。"
 
-    total_items = len(inventory_df)
-    low_count = len(low_stock_df)
-    over_stock_df = inventory_df[inventory_df["status"] == "過剰在庫"]
+    # OpenAI用に送るデータを絞る
+    inventory_summary_df = inventory_df[
+        ["product_code", "product_name", "current_stock", "min_stock", "optimal_stock", "status"]
+    ].copy()
 
-    advice_lines = []
-    advice_lines.append("### 🤖 AI在庫分析レポート")
-    advice_lines.append("")
+    inventory_summary = inventory_summary_df.to_csv(index=False)
 
-    if api_key:
-        advice_lines.append("Gemini APIキーが設定されています。")
-        advice_lines.append("現在はMVP版のため、ルールベース分析で表示しています。")
-        advice_lines.append("今後ここにGemini連携を追加できます。")
-        advice_lines.append("")
+    # プロンプト作成
+    prompt = f"""
+あなたは物流会社の在庫管理アドバイザーです。
+以下の在庫データを見て、日本語でわかりやすく分析してください。
 
-    advice_lines.append(f"- 登録商品数: **{total_items}件**")
-    advice_lines.append(f"- 要発注商品数: **{low_count}件**")
-    advice_lines.append(f"- 過剰在庫候補: **{len(over_stock_df)}件**")
-    advice_lines.append("")
+条件:
+- 要発注の商品を優先して伝える
+- 過剰在庫の可能性がある商品も伝える
+- 現場担当者にも分かるやさしい表現で書く
+- 箇条書きで簡潔にまとめる
+- 最後に「今日やるべきこと」を2〜3個提案する
+- Markdown形式で見出し付きにする
 
-    if low_count > 0:
-        advice_lines.append("#### ⚠️ 要発注候補")
-        for _, row in low_stock_df.iterrows():
-            advice_lines.append(
-                f"- **{row['product_name']}**：現在庫 {format_number(row['current_stock'])} / 最低在庫 {format_number(row['min_stock'])}"
-            )
-        advice_lines.append("")
-        advice_lines.append("**提案:** 早めの補充や発注スケジュール確認をおすすめします。")
-    else:
-        advice_lines.append("#### ✅ 在庫状況")
-        advice_lines.append("現在、最低在庫を下回っている商品はありません。")
+在庫データ:
+{inventory_summary}
+"""
 
-    if len(over_stock_df) > 0:
-        advice_lines.append("")
-        advice_lines.append("#### 📦 過剰在庫候補")
-        for _, row in over_stock_df.iterrows():
-            advice_lines.append(
-                f"- **{row['product_name']}**：現在庫 {format_number(row['current_stock'])} / 適正在庫 {format_number(row['optimal_stock'])}"
-            )
-        advice_lines.append("")
-        advice_lines.append("**提案:** 入庫調整や出庫促進を検討してください。")
+    try:
+        client = OpenAI(api_key=api_key)
 
-    advice_lines.append("")
-    advice_lines.append("---")
-    advice_lines.append("※ Gemini APIを使う場合は、この関数を差し替えて自然言語分析を追加できます。")
+        response = client.responses.create(
+            model="gpt-5.4",
+            input=prompt
+        )
 
-    return "\n".join(advice_lines)
+        # SDKの戻り値から本文を安全に取り出す
+        output_text = getattr(response, "output_text", None)
 
+        if output_text and str(output_text).strip():
+            return output_text
+
+        # 念のためのフォールバック
+        return "### 🤖 AI分析\n\nAIからの応答はありましたが、本文を取得できませんでした。"
+
+    except Exception as e:
+        return f"""### 🤖 AI分析エラー
+
+OpenAI APIの呼び出し中にエラーが発生しました。
+
+**エラー内容:**
+`{e}`
+
+現在は簡易分析モードでの利用をおすすめします。
+"""
 
 # =========================================================
 # 表示用
