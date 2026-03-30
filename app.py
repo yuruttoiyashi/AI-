@@ -927,10 +927,10 @@ def show_product_csv_import():
 
     if uploaded_file is not None:
         try:
-            df_csv = pd.read_csv(uploaded_file, encoding="utf-8-sig")
-        except Exception:
-            uploaded_file.seek(0)
-            df_csv = pd.read_csv(uploaded_file, encoding="utf-8")
+            df_csv = read_flexible_csv(uploaded_file)
+        except Exception as e:
+            st.error(f"CSV読み込みエラー: {e}")
+            return
 
         st.markdown("### ③ 読み込み内容プレビュー")
         st.dataframe(df_csv, use_container_width=True)
@@ -946,7 +946,6 @@ def show_product_csv_import():
                         st.write(f"- {err}")
             else:
                 st.error(message)
-
 
 def show_product_list():
     st.subheader("📋 商品一覧")
@@ -978,31 +977,46 @@ def show_product_list():
     )
 
 
-def show_inbound_form():
-    st.subheader("📥 入庫登録")
+def show_inbound_csv_import():
+    st.subheader("📥 入庫CSV一括取込")
 
-    products = get_product_options()
+    st.markdown("### ① テンプレートをダウンロード")
+    template_df = get_inbound_template_df()
+    st.download_button(
+        "入庫CSVテンプレートをダウンロード",
+        data=to_csv_bytes(template_df),
+        file_name="inbound_template.csv",
+        mime="text/csv"
+    )
 
-    if products.empty:
-        st.warning("先に商品マスタを登録してください。")
-        return
+    st.markdown("### ② CSVをアップロード")
+    uploaded_file = st.file_uploader(
+        "入庫CSVを選択してください",
+        type=["csv"],
+        key="inbound_csv"
+    )
 
-    product_map = {
-        f"{row['product_code']} : {row['product_name']}": row["product_code"]
-        for _, row in products.iterrows()
-    }
+    if uploaded_file is not None:
+        try:
+            df_csv = read_flexible_csv(uploaded_file)
+        except Exception as e:
+            st.error(f"CSV読み込みエラー: {e}")
+            return
 
-    with st.form("inbound_form", clear_on_submit=True):
-        transaction_date = st.date_input("入庫日", value=date.today())
-        selected_product = st.selectbox("商品を選択", list(product_map.keys()))
-        product_code = product_map[selected_product]
-        quantity = st.number_input("数量", min_value=1.0, value=1.0, step=1.0)
-        partner = st.text_input("入庫元（仕入先など）")
-        staff = st.text_input("担当者")
-        remarks = st.text_area("備考")
+        st.markdown("### ③ 読み込み内容プレビュー")
+        st.dataframe(df_csv, use_container_width=True)
 
-        submitted = st.form_submit_button("入庫を確定する")
+        if st.button("この入庫CSVを取り込む"):
+            success, message, errors = import_inbound_from_csv(df_csv)
 
+            if success:
+                st.success(message)
+                if errors:
+                    st.warning("一部エラーがあります。詳細を確認してください。")
+                    for err in errors:
+                        st.write(f"- {err}")
+            else:
+                st.error(message)
     if submitted:
         success, message = add_transaction(
             transaction_date=str(transaction_date),
@@ -1057,56 +1071,46 @@ def show_inbound_csv_import():
                 st.error(message)
 
 
-def show_outbound_form():
-    st.subheader("📤 出庫登録")
+def show_outbound_csv_import():
+    st.subheader("📤 出庫CSV一括取込")
 
-    df_inventory = get_inventory_data()
+    st.markdown("### ① テンプレートをダウンロード")
+    template_df = get_outbound_template_df()
+    st.download_button(
+        "出庫CSVテンプレートをダウンロード",
+        data=to_csv_bytes(template_df),
+        file_name="outbound_template.csv",
+        mime="text/csv"
+    )
 
-    if df_inventory.empty:
-        st.warning("先に商品マスタを登録してください。")
-        return
+    st.markdown("### ② CSVをアップロード")
+    uploaded_file = st.file_uploader(
+        "出庫CSVを選択してください",
+        type=["csv"],
+        key="outbound_csv"
+    )
 
-    product_map = {
-        f"{row['product_code']} : {row['product_name']}（現在庫: {format_number(row['current_stock'])}）": row["product_code"]
-        for _, row in df_inventory.iterrows()
-    }
-
-    with st.form("outbound_form", clear_on_submit=True):
-        transaction_date = st.date_input("出庫日", value=date.today())
-        selected_product = st.selectbox("商品を選択", list(product_map.keys()))
-        product_code = product_map[selected_product]
-
-        current_stock = float(
-            df_inventory.loc[df_inventory["product_code"] == product_code, "current_stock"].iloc[0]
-        )
-        st.info(f"現在庫: {format_number(current_stock)}")
-
-        quantity = st.number_input("数量", min_value=1.0, value=1.0, step=1.0)
-        partner = st.text_input("出庫先（顧客など）")
-        staff = st.text_input("担当者")
-        remarks = st.text_area("備考")
-
-        submitted = st.form_submit_button("出庫を確定する")
-
-    if submitted:
-        if quantity > current_stock:
-            st.error(f"在庫不足です。現在庫は {format_number(current_stock)} です。")
+    if uploaded_file is not None:
+        try:
+            df_csv = read_flexible_csv(uploaded_file)
+        except Exception as e:
+            st.error(f"CSV読み込みエラー: {e}")
             return
 
-        success, message = add_transaction(
-            transaction_date=str(transaction_date),
-            product_code=product_code,
-            transaction_type="OUT",
-            quantity=quantity,
-            partner=partner,
-            staff=staff,
-            remarks=remarks
-        )
-        if success:
-            st.success(f"出庫を登録しました。 商品コード: {product_code} / 数量: {format_number(quantity)}")
-        else:
-            st.error(message)
+        st.markdown("### ③ 読み込み内容プレビュー")
+        st.dataframe(df_csv, use_container_width=True)
 
+        if st.button("この出庫CSVを取り込む"):
+            success, message, errors = import_outbound_from_csv(df_csv)
+
+            if success:
+                st.success(message)
+                if errors:
+                    st.warning("一部エラーがあります。詳細を確認してください。")
+                    for err in errors:
+                        st.write(f"- {err}")
+            else:
+                st.error(message)
 
 def show_outbound_csv_import():
     st.subheader("📤 出庫CSV一括取込")
