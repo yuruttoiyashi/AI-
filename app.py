@@ -109,6 +109,36 @@ def format_number(value) -> str:
 
 
 # =========================================================
+# 商品マスタCSVテンプレート
+# =========================================================
+def get_product_template_df() -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "商品コード": "P001",
+            "商品名": "段ボール箱 100サイズ",
+            "カテゴリ": "資材",
+            "単位": "箱",
+            "保管場所": "A-01",
+            "最低在庫数": 50,
+            "適正在庫数": 200,
+            "仕入先": "山田梱包資材",
+            "備考": "出荷用標準箱"
+        },
+        {
+            "商品コード": "P002",
+            "商品名": "緩衝材 エアパッキン",
+            "カテゴリ": "資材",
+            "単位": "巻",
+            "保管場所": "A-02",
+            "最低在庫数": 10,
+            "適正在庫数": 40,
+            "仕入先": "東日本包装",
+            "備考": "壊れ物梱包用"
+        }
+    ])
+
+
+# =========================================================
 # 商品マスタ関連
 # =========================================================
 def add_product(
@@ -151,6 +181,88 @@ def add_product(
         return False, "この商品コードは既に登録されています。"
     except Exception as e:
         return False, f"登録中にエラーが発生しました: {e}"
+    finally:
+        conn.close()
+
+
+def import_products_from_csv(df_csv: pd.DataFrame):
+    required_cols = [
+        "商品コード", "商品名", "カテゴリ", "単位", "保管場所",
+        "最低在庫数", "適正在庫数", "仕入先", "備考"
+    ]
+
+    missing_cols = [col for col in required_cols if col not in df_csv.columns]
+    if missing_cols:
+        return False, f"CSVに必要な列がありません: {', '.join(missing_cols)}", []
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    inserted = 0
+    skipped = 0
+    errors = []
+
+    try:
+        for idx, row in df_csv.iterrows():
+            try:
+                product_code = str(row["商品コード"]).strip()
+                product_name = str(row["商品名"]).strip()
+
+                if not product_code or product_code.lower() == "nan":
+                    errors.append(f"{idx + 2}行目: 商品コードが空です")
+                    continue
+
+                if not product_name or product_name.lower() == "nan":
+                    errors.append(f"{idx + 2}行目: 商品名が空です")
+                    continue
+
+                category = str(row["カテゴリ"]).strip() if pd.notna(row["カテゴリ"]) else ""
+                unit = str(row["単位"]).strip() if pd.notna(row["単位"]) else ""
+                location = str(row["保管場所"]).strip() if pd.notna(row["保管場所"]) else ""
+                min_stock = float(row["最低在庫数"]) if pd.notna(row["最低在庫数"]) else 0
+                optimal_stock = float(row["適正在庫数"]) if pd.notna(row["適正在庫数"]) else 0
+                supplier = str(row["仕入先"]).strip() if pd.notna(row["仕入先"]) else ""
+                remarks = str(row["備考"]).strip() if pd.notna(row["備考"]) else ""
+
+                if optimal_stock < min_stock:
+                    errors.append(f"{idx + 2}行目: 適正在庫数が最低在庫数より小さいです")
+                    continue
+
+                cur.execute("""
+                    INSERT INTO products (
+                        product_code, product_name, category, unit, location,
+                        min_stock, optimal_stock, supplier, remarks, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    product_code,
+                    product_name,
+                    category,
+                    unit,
+                    location,
+                    min_stock,
+                    optimal_stock,
+                    supplier,
+                    remarks,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                ))
+                inserted += 1
+
+            except sqlite3.IntegrityError:
+                skipped += 1
+            except Exception as e:
+                errors.append(f"{idx + 2}行目: {e}")
+
+        conn.commit()
+        message = f"取込完了: {inserted}件登録 / {skipped}件スキップ"
+        if errors:
+            message += f" / エラー {len(errors)}件"
+        return True, message, errors
+
+    except Exception as e:
+        conn.rollback()
+        return False, f"CSV取込中にエラーが発生しました: {e}", []
     finally:
         conn.close()
 
@@ -314,13 +426,16 @@ def get_inventory_data() -> pd.DataFrame:
 
     df["status"] = df.apply(judge_status, axis=1)
 
-    return df.sort_values(["status", "product_code"], ascending=[True, True])
+    status_order = {"要発注": 0, "注意": 1, "正常": 2, "過剰在庫": 3}
+    df["status_order"] = df["status"].map(status_order)
+    df = df.sort_values(["status_order", "product_code"]).drop(columns=["status_order"])
+
+    return df
 
 
 def get_low_stock_items(df_inventory: pd.DataFrame) -> pd.DataFrame:
     if df_inventory.empty:
         return pd.DataFrame()
-
     return df_inventory[df_inventory["status"] == "要発注"].copy()
 
 
@@ -328,13 +443,8 @@ def get_low_stock_items(df_inventory: pd.DataFrame) -> pd.DataFrame:
 # AI分析
 # =========================================================
 def generate_ai_advice(inventory_df: pd.DataFrame, low_stock_df: pd.DataFrame) -> str:
-    """
-    今はルールベース。
-    後でGemini APIに置き換えやすい形にしてある。
-    """
     api_key = get_api_key()
 
-    # MVPではAPI未設定でも必ず動かす
     if inventory_df.empty:
         return "### 🤖 AI分析\n\nまだ分析できる在庫データがありません。"
 
@@ -348,7 +458,7 @@ def generate_ai_advice(inventory_df: pd.DataFrame, low_stock_df: pd.DataFrame) -
 
     if api_key:
         advice_lines.append("Gemini APIキーが設定されています。")
-        advice_lines.append("現在はMVPのため、ルールベース分析で表示しています。")
+        advice_lines.append("現在はMVP版のため、ルールベース分析で表示しています。")
         advice_lines.append("今後ここにGemini連携を追加できます。")
         advice_lines.append("")
 
@@ -364,7 +474,7 @@ def generate_ai_advice(inventory_df: pd.DataFrame, low_stock_df: pd.DataFrame) -
                 f"- **{row['product_name']}**：現在庫 {format_number(row['current_stock'])} / 最低在庫 {format_number(row['min_stock'])}"
             )
         advice_lines.append("")
-        advice_lines.append("**提案:** 早めの補充や発注スケジュールの確認をおすすめします。")
+        advice_lines.append("**提案:** 早めの補充や発注スケジュール確認をおすすめします。")
     else:
         advice_lines.append("#### ✅ 在庫状況")
         advice_lines.append("現在、最低在庫を下回っている商品はありません。")
@@ -381,7 +491,7 @@ def generate_ai_advice(inventory_df: pd.DataFrame, low_stock_df: pd.DataFrame) -
 
     advice_lines.append("")
     advice_lines.append("---")
-    advice_lines.append("※ Gemini APIを使う場合は、ここを差し替えて自然言語分析を追加できます。")
+    advice_lines.append("※ Gemini APIを使う場合は、この関数を差し替えて自然言語分析を追加できます。")
 
     return "\n".join(advice_lines)
 
@@ -501,6 +611,47 @@ def show_product_form():
             st.success(message)
         else:
             st.error(message)
+
+
+def show_product_csv_import():
+    st.subheader("📂 商品マスタCSV取込")
+
+    st.markdown("### ① テンプレートをダウンロード")
+    template_df = get_product_template_df()
+    st.download_button(
+        "商品マスタCSVテンプレートをダウンロード",
+        data=to_csv_bytes(template_df),
+        file_name="product_master_template.csv",
+        mime="text/csv"
+    )
+
+    st.markdown("### ② CSVをアップロード")
+    uploaded_file = st.file_uploader(
+        "商品マスタCSVを選択してください",
+        type=["csv"]
+    )
+
+    if uploaded_file is not None:
+        try:
+            df_csv = pd.read_csv(uploaded_file, encoding="utf-8-sig")
+        except Exception:
+            uploaded_file.seek(0)
+            df_csv = pd.read_csv(uploaded_file, encoding="utf-8")
+
+        st.markdown("### ③ 読み込み内容プレビュー")
+        st.dataframe(df_csv, use_container_width=True)
+
+        if st.button("このCSVを取り込む"):
+            success, message, errors = import_products_from_csv(df_csv)
+
+            if success:
+                st.success(message)
+                if errors:
+                    st.warning("一部エラーがあります。詳細を確認してください。")
+                    for err in errors:
+                        st.write(f"- {err}")
+            else:
+                st.error(message)
 
 
 def show_product_list():
@@ -716,6 +867,7 @@ def main():
     menu = [
         "ダッシュボード",
         "商品マスタ登録",
+        "商品マスタCSV取込",
         "商品一覧",
         "入庫登録",
         "出庫登録",
@@ -728,6 +880,8 @@ def main():
         show_dashboard()
     elif choice == "商品マスタ登録":
         show_product_form()
+    elif choice == "商品マスタCSV取込":
+        show_product_csv_import()
     elif choice == "商品一覧":
         show_product_list()
     elif choice == "入庫登録":
